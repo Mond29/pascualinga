@@ -1,0 +1,108 @@
+import { StyleSheet } from "react-native"
+
+const LoadingStyles = StyleSheet.create({
+    mainContainer:{ 
+        flex:1,
+        justifyContent:'center',
+        alignItems:'center',
+        width:'100%',
+        height:'100%',
+        backgroundColor: '#F8FAFC',
+        paddingHorizontal: 24,
+    },
+    logoCard: {
+        width: '100%',
+        maxWidth: 420,
+        backgroundColor: '#FFFFFF',
+        borderRadius: 30,
+        paddingVertical: 36,
+        paddingHorizontal: 24,
+        alignItems: 'center',
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 10 },
+        shadowOpacity: 0.08,
+        shadowRadius: 20,
+        elevation: 10,
+    },
+    logo: {
+        width: 130,
+        height: 130,
+        resizeMode: 'contain',
+    },
+    appTitle: {
+        marginTop: 12,
+        fontSize: 26,
+        fontWeight: '900',
+        color: '#1E293B',
+        letterSpacing: 0.2,
+    },
+    appSubtitle: {
+        marginTop: 4,
+        fontSize: 13,
+        fontWeight: '700',
+        color: '#64748B',
+    },
+    statusRow: {
+        marginTop: 18,
+        flexDirection: 'row',
+        alignItems: 'center',
+    },
+    statusText: {
+        marginLeft: 10,
+        fontSize: 13,
+        fontWeight: '700',
+        color: '#475569',
+    },
+    actionsRow: {
+        marginTop: 18,
+        width: '100%',
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+    },
+    primaryButton: {
+        flex: 1,
+        marginLeft: 10,
+        height: 46,
+        borderRadius: 14,
+        backgroundColor: '#DA7705',
+        alignItems: 'center',
+        justifyContent: 'center',
+        shadowColor: '#DA7705',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.25,
+        shadowRadius: 8,
+        elevation: 5,
+    },
+    primaryButtonText: {
+        color: '#FFFFFF',
+        fontSize: 14,
+        fontWeight: '800',
+        letterSpacing: 0.3,
+    },
+    secondaryButton: {
+        flex: 1,
+        marginRight: 10,
+        height: 46,
+        borderRadius: 14,
+        backgroundColor: '#FFFFFF',
+        borderWidth: 1.5,
+        borderColor: '#FED7AA',
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    secondaryButtonText: {
+        color: '#DA7705',
+        fontSize: 14,
+        fontWeight: '800',
+        letterSpacing: 0.2,
+    },
+    footerHint: {
+        marginTop: 14,
+        fontSize: 12,
+        fontWeight: '600',
+        color: '#94A3B8',
+    },
+
+})
+
+export default LoadingStyles
