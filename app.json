@@ -14,6 +14,7 @@
     },
     "ios": {
       "supportsTablet": true,
+      "bundleIdentifier": "com.pascualinga.app",
       "infoPlist": {
         "NSCameraUsageDescription": "Pascualinga needs access to your camera so you can join video consultations with your doctor.",
         "NSMicrophoneUsageDescription": "Pascualinga needs access to your microphone so you can speak during video consultations.",
