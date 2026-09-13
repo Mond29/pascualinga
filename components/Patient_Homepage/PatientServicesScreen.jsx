@@ -3183,9 +3183,9 @@ export default function PatientServicesScreen() {
       description: "Heart monitoring to detect cardiac conditions.",
       icon: "heart-outline",
       subServices: [
-        { name: "Standard 12-Lead ECG", price: "₱450", duration: "20 mins" },
-        { name: "Stress Test", price: "₱2,500", duration: "45 mins" },
-        { name: "Holter Monitoring", price: "₱3,500", duration: "30 mins" },
+        { name: "Standard 12-Lead ECG", price: "TBD", duration: "20 mins" },
+        { name: "Stress Test", price: "TBD", duration: "45 mins" },
+        { name: "Holter Monitoring", price: "TBD", duration: "30 mins" },
       ]
     },
     {
@@ -3194,10 +3194,10 @@ export default function PatientServicesScreen() {
       description: "X-ray and imaging services for diagnosis.",
       icon: "scan-outline",
       subServices: [
-        { name: "Chest X-Ray", price: "₱400", duration: "15 mins" },
-        { name: "Pelvic Ultrasound", price: "₱800", duration: "20 mins" },
-        { name: "Abdominal CT Scan", price: "₱5,500", duration: "30 mins" },
-        { name: "MRI (Brain)", price: "₱8,000", duration: "45 mins" },
+        { name: "Chest X-Ray", price: "TBD", duration: "15 mins" },
+        { name: "Pelvic Ultrasound", price: "TBD", duration: "20 mins" },
+        { name: "Abdominal CT Scan", price: "TBD", duration: "30 mins" },
+        { name: "MRI (Brain)", price: "TBD", duration: "45 mins" },
       ]
     },
     {
@@ -3217,10 +3217,10 @@ export default function PatientServicesScreen() {
       description: "Dental care including cleaning and treatment.",
       icon: "medical-outline",
       subServices: [
-        { name: "Tooth Extraction", price: "₱1,000", duration: "30 mins" },
-        { name: "Dental Cleaning (Prophylaxis)", price: "₱1,200", duration: "45 mins" },
-        { name: "Fillings (Pasta)", price: "₱800", duration: "30 mins" },
-        { name: "Braces Consultation", price: "₱500", duration: "20 mins" },
+        { name: "Tooth Extraction", price: "TBD", duration: "30 mins" },
+        { name: "Dental Cleaning (Prophylaxis)", price: "TBD", duration: "45 mins" },
+        { name: "Fillings (Pasta)", price: "TBD", duration: "30 mins" },
+        { name: "Braces Consultation", price: "TBD", duration: "20 mins" },
       ]
     },
     {
@@ -4910,6 +4910,7 @@ export default function PatientServicesScreen() {
                     try { goToScheduleNormal(); } catch (_) {}
                     return;
                   }
+                  try { goToScheduleNormal(); } catch (_) {}
                 } catch (_) {}
               }
             }

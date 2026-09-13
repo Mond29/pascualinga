@@ -18,7 +18,8 @@
       "infoPlist": {
         "NSCameraUsageDescription": "Pascualinga needs access to your camera so you can join video consultations with your doctor.",
         "NSMicrophoneUsageDescription": "Pascualinga needs access to your microphone so you can speak during video consultations.",
-        "NSPhotoLibraryUsageDescription": "Pascualinga may request photo access to attach documents to consultation records."
+        "NSPhotoLibraryUsageDescription": "Pascualinga may request photo access to attach documents to consultation records.",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
@@ -47,6 +48,13 @@
     "extra": {
       "eas": {
         "projectId": "15432362-49f1-45fd-bd26-3d0246467859"
+      }
+    },
+    "submit": {
+      "production": {
+        "ios": {
+          "ascAppId": "6810953112"
+        }
       }
     }
   }
