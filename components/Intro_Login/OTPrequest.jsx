@@ -1,31 +1,179 @@
 import React, { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, Alert, ActivityIndicator, StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform } from 'react-native';
 import { supabase } from '../../lib/supabase';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
 
+const getApiBaseUrl = () => {
+  const rawBase = `${process.env.EXPO_PUBLIC_API_BASE_URL || ''}`.trim();
+  return rawBase ? rawBase.replace(/\/+$/, '') : 'https://api.pascualinga.com';
+};
+
+const saveCurrentUser = async (verifiedUser) => {
+  if (!verifiedUser || typeof verifiedUser !== 'object') return;
+  try {
+    await AsyncStorage.setItem('currentUser', JSON.stringify({ ...verifiedUser, updatedAt: Date.now() }));
+  } catch (_) {}
+  const extractToken = (obj) => {
+    if (!obj || typeof obj !== 'object') return '';
+    const candFields = ['sessionToken', 'session_token', 'token', 'accessToken', 'access_token', 'authToken', 'auth_token', 'jwt', 'bearer'];
+    for (const f of candFields) {
+      if (typeof obj[f] === 'string' && obj[f].length > 20) return obj[f];
+      const d = obj.data;
+      if (d && typeof d === 'object' && typeof d[f] === 'string' && d[f].length > 20) return d[f];
+    }
+    return '';
+  };
+  const token = extractToken(verifiedUser);
+  const e = `${verifiedUser.email || ''}`.trim().toLowerCase();
+  if (token) {
+    try { await AsyncStorage.setItem('verifiedUser', JSON.stringify({ ...(verifiedUser.user || verifiedUser.profile || {}), sessionToken: token, email: e, updatedAt: Date.now() })); } catch (_) {}
+    try { await AsyncStorage.setItem('sessionToken', token); } catch (_) {}
+    try { if (e) await AsyncStorage.setItem(`sessionToken:${e}`, token); } catch (_) {}
+  }
+};
+
 export default function OTPRequest({ route, navigation }) {
-  const { userData, correctOTP, recoveryMode } = route.params;
+  const params = route?.params || {};
+  const { userData, correctOTP, recoveryMode, loginMode, challengeId, backendRole, backendLoginResponse } = params;
   const [userOTP, setUserOTP] = useState('');
   const [isVerifying, setIsVerifying] = useState(false);
 
   const handleVerify = async () => {
     const inputCode = String(userOTP).trim();
-    const expectedCode = String(correctOTP).trim();
+    const expectedCode = String(correctOTP || '').trim();
+    const targetEmail = userData && userData.email ? String(userData.email).trim().toLowerCase() : '';
+
+    if (recoveryMode) {
+      if (inputCode !== expectedCode) {
+        Alert.alert("Invalid Code", "The OTP you entered is incorrect. Please try again.");
+        return;
+      }
+      Alert.alert("Verified", "You can now reset your password.");
+      navigation.navigate('ChangePassword', { email: targetEmail });
+      return;
+    }
+
+    if (loginMode) {
+      if (!targetEmail) {
+        Alert.alert("Login Error", "No target email was passed from login screen. Please log in again.");
+        return;
+      }
+      const nm = userData && userData.name ? String(userData.name).trim() : targetEmail;
+      const role = (backendRole && typeof backendRole === 'string') ? backendRole.toLowerCase().trim() : (userData && userData.roles ? String(userData.roles).toLowerCase().trim() : 'patient');
+      await AsyncStorage.setItem('userEmail', targetEmail);
+      await AsyncStorage.setItem('userRole', role);
+      if (nm) await AsyncStorage.setItem(`userName:${targetEmail}`, nm);
+      try { await AsyncStorage.removeItem('currentUser'); } catch (_) {}
+      try { await AsyncStorage.removeItem('verifiedUser'); } catch (_) {}
+      try { await AsyncStorage.removeItem('sessionToken'); } catch (_) {}
+      try { await AsyncStorage.removeItem(`sessionToken:${targetEmail}`); } catch (_) {}
+
+      const password = userData && (userData.password || userData.pass || userData.pwd) ? String(userData.password || userData.pass || userData.pwd) : '';
+      const extractedChallenge = (() => {
+        if (challengeId && typeof challengeId === 'string' && challengeId.trim()) return challengeId.trim();
+        if (backendLoginResponse && typeof backendLoginResponse === 'object') {
+          for (const k of ['challengeId', 'challenge_id', 'challenge', 'requestId', 'request_id', 'otpChallengeId', 'otp_challenge_id', 'nonce', 'state']) {
+            if (backendLoginResponse[k] && typeof backendLoginResponse[k] === 'string' && backendLoginResponse[k].trim()) return backendLoginResponse[k].trim();
+            const d = backendLoginResponse.data;
+            if (d && typeof d === 'object' && d[k] && typeof d[k] === 'string' && d[k].trim()) return d[k].trim();
+          }
+        }
+        return '';
+      })();
+      const codeFromBackend = (() => {
+        if (expectedCode) return expectedCode;
+        if (backendLoginResponse && typeof backendLoginResponse === 'object') {
+          for (const k of ['otp', 'code', 'correctOtp', 'correct_otp', 'correctCode', 'correct_code', 'sentOtp', 'sent_otp']) {
+            if (backendLoginResponse[k] && typeof backendLoginResponse[k] === 'string') return backendLoginResponse[k];
+            const d = backendLoginResponse.data;
+            if (d && typeof d === 'object' && d[k] && typeof d[k] === 'string') return d[k];
+          }
+        }
+        return '';
+      })();
+      const otpMatch = inputCode === expectedCode || (expectedCode && inputCode && inputCode.toLowerCase() === expectedCode.toLowerCase()) || (codeFromBackend && inputCode === codeFromBackend);
+
+      setIsVerifying(true);
+      let verifiedUser = null;
+      let supabaseAuthToken = '';
+      try {
+        // ----------------------------------------------------------------
+        // Per backend commit da276d29: Use Supabase session directly.
+        // If OTP matches locally, create Supabase Auth session so
+        // we get access_token for Authorization: Bearer header.
+        // No extra web OTP backend endpoints or guessed endpoints.
+        // ----------------------------------------------------------------
+        if (otpMatch && password && targetEmail) {
+          try {
+            const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+              email: targetEmail,
+              password: password,
+            });
+            if (!authError && authData?.session?.access_token) {
+              supabaseAuthToken = authData.session.access_token.trim();
+              verifiedUser = {
+                user: { email: targetEmail, role, name: nm },
+                session: authData.session,
+                access_token: supabaseAuthToken,
+                accessToken: supabaseAuthToken,
+                sessionToken: supabaseAuthToken,
+                email: targetEmail,
+                role,
+                source: 'otp-login:supabase-auth',
+              };
+            }
+            // eslint-disable-next-line no-console
+            console.log('[Forensics: otp-login:supabase-auth]', {
+              targetEmail: targetEmail ? `${targetEmail.substring(0, 3)}***@***` : '',
+              role,
+              otpMatch: true,
+              gotSupabaseSession: Boolean(authData?.session),
+              gotToken: Boolean(supabaseAuthToken),
+              tokenLength: String(supabaseAuthToken || '').length,
+              authErrorCode: authError?.code || '',
+              authErrorMessage: authError?.message || '',
+              note: 'Per #1 instruction: Supabase only — extra web OTP endpoints and guessed login endpoints removed. Lab results use this JWT via supabase.auth.getSession() as Bearer.',
+            });
+          } catch (authErr) {
+            // eslint-disable-next-line no-console
+            console.log('[Forensics: otp-login:supabase-auth] signInWithPassword threw (non-fatal, continue):', {
+              message: authErr?.message || String(authErr || ''),
+            });
+          }
+        }
+
+        if (verifiedUser) {
+          await saveCurrentUser(verifiedUser);
+          console.log('[Auth:otp:saved]', {
+            hasSessionToken: true,
+            email: targetEmail ? `${targetEmail.substring(0, 3)}***@***` : '',
+            role,
+          });
+        }
+      } catch (_) {}
+      finally {
+        setIsVerifying(false);
+      }
+
+      if (!otpMatch) {
+        Alert.alert(
+          "Invalid Code",
+          "The OTP you entered is incorrect. Please try again.\n\nIf you did not receive an OTP, please request a new one from your web team."
+        );
+        return;
+      }
+      if (role === 'nurse' || role === 'lab' || role === 'doctor') navigation.replace('NurseBottomTabs');
+      else navigation.replace('PatientBottomTabs');
+      return;
+    }
 
     if (inputCode !== expectedCode) {
       Alert.alert("Invalid Code", "The OTP you entered is incorrect. Please try again.");
       return;
     }
 
-    if (recoveryMode) {
-      // Branch for Account Recovery
-      Alert.alert("Verified", "You can now reset your password.");
-      navigation.navigate('ChangePassword', { email: userData.email });
-      return;
-    }
-
-    // Branch for Registration
     setIsVerifying(true);
     try {
       const targetEmail = userData.email.trim().toLowerCase();
@@ -99,11 +247,127 @@ export default function OTPRequest({ route, navigation }) {
           );
       } catch (_) {}
 
-      Alert.alert(
-        "Verified!", 
-        "Account created successfully.", 
-        [{ text: "Proceed to Login", onPress: () => navigation.replace('LoginScreen') }]
-      );
+      // ----------------------------------------------------------------
+      // NEW: Immediately create Supabase Auth user for this new account
+      // (required for backend commit da276d29: Authorization: Bearer
+      // <Supabase JWT access_token> on /api/lab-results/mine etc).
+      // If signUp fails due to signup_disabled, still allow registration
+      // (the account already exists in accounts+patients tables) but warn
+      // the user that PDF downloads won't work until an admin provisions
+      // the Supabase Auth user.
+      // ----------------------------------------------------------------
+      let supabaseSignUpErrorCode = '';
+      let supabaseSignUpErrorMessage = '';
+      let supabaseSignUpGotToken = false;
+      try {
+        const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
+          email: targetEmail,
+          password: String(userData.password),
+          options: {
+            data: {
+              name: `${userData.name || ''}`.trim(),
+              first_name: firstName,
+              last_name: lastName,
+              role: 'patient',
+              display_name: `${userData.name || ''}`.trim(),
+              address: `${userData.address || ''}`.trim(),
+              age: parseInt(userData.age) || null,
+              birthday: dob,
+              contact_number: phone,
+              gender: gender,
+            },
+            emailRedirectTo: undefined,
+          },
+        });
+        if (signUpError) {
+          supabaseSignUpErrorCode = signUpError.code || '';
+          supabaseSignUpErrorMessage = signUpError.message || '';
+        } else if (signUpData?.session?.access_token || signUpData?.user) {
+          supabaseSignUpGotToken = Boolean(signUpData?.session?.access_token);
+          if (signUpData?.session?.access_token) {
+            try {
+              await supabase.auth.signOut().catch(() => {});
+            } catch (_) {}
+          }
+        }
+        // eslint-disable-next-line no-console
+        console.log('[Forensics: registration:supabase-signup]', {
+          step: 'Registration: create Supabase Auth user alongside accounts+patients inserts',
+          emailSanitized: targetEmail ? `${targetEmail.substring(0, 3)}***@***` : '',
+          role: 'patient',
+          gotAuthUser: !(supabaseSignUpErrorCode),
+          gotSession: supabaseSignUpGotToken,
+          supabaseSignUpErrorCode,
+          supabaseSignUpErrorMessage: (supabaseSignUpErrorMessage || '').substring(0, 220),
+          note: 'Required for backend commit da276d29: when this user logs in, supabase.auth.signInWithPassword() will return a live JWT access_token used as Authorization: Bearer header on /api/lab-results/mine and PDF endpoints. If gotAuthUser=false due to signup_disabled, admin must manually add user to Supabase Authentication > Users before PDF downloads will work for this account.',
+        });
+      } catch (signUpErr) {
+        supabaseSignUpErrorCode = 'registration_signup_threw';
+        supabaseSignUpErrorMessage = signUpErr?.message || String(signUpErr || '');
+        // eslint-disable-next-line no-console
+        console.log('[Forensics: registration:supabase-signup] threw (non-fatal — account already created in accounts+patients):', {
+          message: supabaseSignUpErrorMessage.substring(0, 220),
+        });
+      }
+
+      try {
+        const base = getApiBaseUrl();
+        const endpoints = [
+          `${base}/api/patients/login/otp/verify`,
+          `${base}/api/patient/login/otp/verify`,
+          `${base}/api/staff/login/otp/verify`,
+        ];
+        let p = null;
+        for (const ep of endpoints) {
+          try {
+            const res = await fetch(ep, {
+              method: 'POST',
+              headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                email: targetEmail,
+                password: String(userData.password),
+                otp: inputCode,
+                code: inputCode,
+              }),
+            });
+            const txt = await res.text().catch(() => '');
+            if (!res.ok) continue;
+            try { p = JSON.parse(txt); break; } catch (_) { p = { rawText: txt }; break; }
+          } catch (_) {}
+        }
+        if (p && typeof p === 'object') {
+          let t = '';
+          const candFields = ['sessionToken', 'session_token', 'token', 'accessToken', 'access_token', 'authToken', 'auth_token', 'jwt', 'bearer'];
+          for (const f of candFields) {
+            if (p[f] && typeof p[f] === 'string') { t = p[f]; break; }
+            const d = p.data;
+            if (d && typeof d === 'object' && d[f] && typeof d[f] === 'string') { t = d[f]; break; }
+          }
+          if (t) {
+            const wrapped = { sessionToken: t, email: targetEmail, source: 'registration:otp:verify', role: 'patient' };
+            await saveCurrentUser(wrapped);
+          }
+        }
+      } catch (_) {}
+
+      if (supabaseSignUpErrorCode === 'signup_disabled') {
+        Alert.alert(
+          "Account Created — Attention Needed!", 
+          "Your Pascualinga patient account was created successfully (you can log in now).\n\n" +
+          "However, Supabase Auth signups are currently DISABLED on this project.\n\n" +
+          "This means PDF Lab Results downloads will NOT work for your account until the administrator manually adds your email to the Supabase Auth Users dashboard.\n\n" +
+          "If you are the admin, go to:\n" +
+          "Supabase → Authentication → Users → Add user → enter email: " + targetEmail + " with your chosen password, and CHECK \"Email confirmed\".\n\n" +
+          "If you are a patient, message the clinic/developer to enable your Supabase Auth record. Thank you!",
+          [{ text: "Proceed to Login", onPress: () => navigation.replace('LoginScreen') }]
+        );
+      } else {
+        Alert.alert(
+          "Verified!", 
+          "Account created successfully. You may log in now.", 
+          [{ text: "Proceed to Login", onPress: () => navigation.replace('LoginScreen') }]
+        );
+      }
     } catch (err) {
       Alert.alert("Database Error", err.message);
     } finally {

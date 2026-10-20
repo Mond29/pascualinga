@@ -122,7 +122,6 @@ export default function LoginScreen() {
   const handleLogin = async () => {
     if (locked || loading) return;
 
-    // Trigger validations
     validateEmail(email);
     validatePassword(password);
 
@@ -133,11 +132,17 @@ export default function LoginScreen() {
     setLoading(true);
 
     try {
+      const normalizedEmail = email.toLowerCase().trim();
+
+      // ----------------------------------------------------------------
+      // STEP 1: Verify credentials against Supabase accounts table
+      // (This preserves current login flow that works.)
+      // ----------------------------------------------------------------
       const { data, error } = await supabase
         .from('accounts')
         .select('name, roles')
-        .eq('email', email.toLowerCase().trim())
-        .eq('password', password) 
+        .eq('email', normalizedEmail)
+        .eq('password', password)
         .single();
 
       if (error || !data) {
@@ -146,30 +151,150 @@ export default function LoginScreen() {
         return;
       }
 
-      setLoading(false);
-      setFailedAttempts(0);
-      
       const userRole = data.roles ? data.roles.toLowerCase().trim() : '';
       const userName = data.name || 'User';
 
-      console.log(`✅ Login Success: ${userName} (${userRole})`);
+      // ----------------------------------------------------------------
+      // NEW per backend commit da276d29 (Supabase patient sessions):
+      // STEP 2: Create actual Supabase Auth session so we get a valid
+      // access_token to send as Authorization: Bearer <token> when
+      // fetching /api/lab-results/mine, /api/billing/..., etc.
+      // Backend will validate this JWT against the same Supabase project
+      // (iknkfjzoubkymcwprrux). If signIn fails, AUTO-CREATE the user
+      // in Supabase Auth via signUp() using the same email + password
+      // (credentials already verified against accounts table above),
+      // then re-run signInWithPassword to get the live session.
+      // ----------------------------------------------------------------
+      let supabaseAuthToken = '';
+      let supabaseAuthSession = null;
+      let authErrorCode = '';
+      let authErrorMessage = '';
+      let authFlow = 'signInWithPassword';
+      try {
+        let { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+          email: normalizedEmail,
+          password: password,
+        });
+        if (authError) {
+          authErrorCode = authError.code || '';
+          authErrorMessage = authError.message || '';
+          // signIn failed — user likely doesn't exist in Supabase Auth yet
+          // (only exists in plaintext accounts table). Create them now.
+          authFlow = 'signUp then signInWithPassword';
+          const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
+            email: normalizedEmail,
+            password: password,
+            options: {
+              data: { name: userName, role: userRole, display_name: userName },
+              emailRedirectTo: undefined,
+            },
+          });
+          if (signUpError) {
+            // signUp also failed — log but don't block login
+            authErrorCode = signUpError.code || authErrorCode;
+            authErrorMessage = signUpError.message || authErrorMessage;
+          } else {
+            // signUp OK — now do a real sign-in to guarantee a live session
+            const re = await supabase.auth.signInWithPassword({
+              email: normalizedEmail,
+              password: password,
+            });
+            if (!re.error && re.data?.session?.access_token) {
+              authData = re.data;
+              authErrorCode = '';
+              authErrorMessage = '';
+            } else if (re.error) {
+              authErrorCode = re.error.code || authErrorCode;
+              authErrorMessage = re.error.message || authErrorMessage;
+            } else if (signUpData?.session?.access_token) {
+              // signUp itself returned a session (auto-confirm enabled)
+              authData = signUpData;
+              authErrorCode = '';
+              authErrorMessage = '';
+            }
+          }
+        }
+        if (!authErrorCode && authData?.session?.access_token) {
+          supabaseAuthSession = authData.session;
+          supabaseAuthToken = authData.session.access_token.trim();
+        } else if (!authErrorCode && authData?.user && signUpData?.session?.access_token) {
+          supabaseAuthSession = signUpData.session;
+          supabaseAuthToken = signUpData.session.access_token.trim();
+        }
+        // eslint-disable-next-line no-console
+        console.log('[Forensics: login:supabase-auth]', {
+          step: 'Supabase auth for backend Bearer JWT',
+          authFlow,
+          emailSanitized: normalizedEmail ? `${normalizedEmail.substring(0, 3)}***@***` : '',
+          role: userRole,
+          gotSession: Boolean(supabaseAuthSession),
+          gotToken: Boolean(supabaseAuthToken),
+          tokenLength: String(supabaseAuthToken || '').length,
+          authErrorCode,
+          authErrorMessage: authErrorMessage.substring(0, 200),
+          note: 'Backend commit da276d29 validates this JWT access_token as Authorization: Bearer header for /api/* endpoints. If gotToken=false, lab-results/mine returns HTTP 401. User creation via signUp was attempted automatically when signInWithPassword failed (credentials already verified against accounts table).',
+        });
+      } catch (authErr) {
+        // eslint-disable-next-line no-console
+        console.log('[Forensics: login:supabase-auth] auth flow threw (non-fatal, continue but lab API will 401):', {
+          authFlow,
+          message: authErr?.message || String(authErr || ''),
+        });
+      }
 
-      // Store user email and role in AsyncStorage for role-based logic
-      const normalizedEmail = email.toLowerCase().trim();
+      // Persist user identity (same as before)
       await AsyncStorage.setItem('userEmail', normalizedEmail);
       await AsyncStorage.setItem('userRole', userRole);
       await AsyncStorage.removeItem('userName');
       await AsyncStorage.setItem(`userName:${normalizedEmail}`, `${userName}`.trim());
+      try { await AsyncStorage.removeItem('currentUser'); } catch (_) {}
+      try { await AsyncStorage.removeItem('verifiedUser'); } catch (_) {}
+      try { await AsyncStorage.removeItem('sessionToken'); } catch (_) {}
+      try { await AsyncStorage.removeItem(`sessionToken:${normalizedEmail}`); } catch (_) {}
+      setFailedAttempts(0);
+      setLoading(false);
 
-      if (userRole === 'nurse' || userRole === 'lab') {
-        navigation.replace('NurseBottomTabs');
-      } else if (userRole === 'patient') {
-        navigation.replace('PatientBottomTabs');
-      } else if (userRole === 'doctor') {
-        await postStaffHeartbeat({ email: normalizedEmail, name: userName });
-        navigation.replace('NurseBottomTabs');
+      // --------------------------------------------------------------
+      // If Supabase Auth user creation failed because signups are
+      // disabled globally, warn the user immediately — otherwise they
+      // will only see the issue when they try to download a PDF and
+      // get the red banner + 401 error. This applies to EXISTING
+      // accounts that were created in the accounts table before
+      // backend commit da276d29 switched to Supabase JWT auth.
+      // --------------------------------------------------------------
+      const proceedWithNavigation = () => {
+        if (userRole === 'nurse' || userRole === 'lab') navigation.replace('NurseBottomTabs');
+        else if (userRole === 'patient') navigation.replace('PatientBottomTabs');
+        else if (userRole === 'doctor') {
+          postStaffHeartbeat({ email: normalizedEmail, name: userName }).catch(() => {});
+          navigation.replace('NurseBottomTabs');
+        } else {
+          Alert.alert('Access Denied', `Role "${userRole}" is not configured in this app.`);
+        }
+      };
+      if (authErrorCode === 'signup_disabled' && !supabaseAuthToken) {
+        Alert.alert(
+          '⚠️ Login OK — PDF Downloads Disabled',
+          'Your account was verified against the accounts table and you may continue using the app.\n\n' +
+          'HOWEVER: The app tried to create your Supabase Auth user automatically (required for PDF Lab Result downloads via commit da276d29), but Supabase Auth signups are currently DISABLED on this project.\n\n' +
+          'For the admin / developer — there are 2 ways to fix this:\n\n' +
+          'OPTION A — BULK SEED EXISTING ACCOUNTS (RECOMMENDED, SECURE):\n' +
+          'Supabase Dashboard → Authentication → Users → Add user\n' +
+          '• Email: ' + normalizedEmail + '\n' +
+          '• Password: (same password the user uses to login)\n' +
+          '• CHECK "Email confirmed"\n' +
+          'Repeat for ALL ~10 existing patient accounts. Signups remain DISABLED after — safest for production.\n\n' +
+          'OPTION B — TEMPORARILY ENABLE SIGNUPS (FASTER BUT LESS SECURE):\n' +
+          'Supabase Dashboard → Authentication → Configuration → Sign In / Providers → Email Provider → Settings → ENABLE "Allow user signups" → Save.\n' +
+          'Then tell all existing users to: Logout → Login ONCE (auto-signUp creates their auth entry).\n' +
+          'After everyone has logged in once, DISABLE signups again for security.\n\n' +
+          'New users registering via "Create Account" will also see this warning until one of the above options is applied.',
+          [
+            { text: 'OK, I understand — take me to the app', style: 'default', onPress: proceedWithNavigation },
+          ],
+        );
       } else {
-        Alert.alert('Access Denied', `Role "${userRole}" is not configured in this app.`);
+        proceedWithNavigation();
       }
 
     } catch (err) {

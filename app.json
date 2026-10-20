@@ -4,14 +4,7 @@
     "slug": "Pascualinga",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/pgh_logo.png",
     "userInterfaceStyle": "light",
-    "newArchEnabled": false,
-    "splash": {
-      "image": "./assets/pgh_logo.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#d9802b"
-    },
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.pascualinga.app",
@@ -24,11 +17,6 @@
     },
     "android": {
       "package": "com.pascualinga.app",
-      "adaptiveIcon": {
-        "foregroundImage": "./assets/pgh_logo.png",
-        "backgroundColor": "#d9802b"
-      },
-      "edgeToEdgeEnabled": true,
       "permissions": [
         "CAMERA",
         "RECORD_AUDIO",
@@ -39,7 +27,6 @@
       ]
     },
     "web": {
-      "favicon": "./assets/pgh_logo.png"
     },
     "plugins": [
       "expo-font",
@@ -50,12 +37,6 @@
         "projectId": "15432362-49f1-45fd-bd26-3d0246467859"
       }
     },
-    "submit": {
-      "production": {
-        "ios": {
-          "ascAppId": "6810953112"
-        }
-      }
-    }
+    "owner": "pascualinga"
   }
 }

@@ -1,9 +1,11 @@
 import React, { useCallback, useMemo, useState } from 'react';
-import { View, Text, StyleSheet, SafeAreaView, TouchableOpacity, FlatList, TextInput, Modal, ActivityIndicator, Alert, ScrollView, Linking } from 'react-native';
+import { View, Text, StyleSheet, SafeAreaView, TouchableOpacity, FlatList, TextInput, Modal, ActivityIndicator, Alert, ScrollView, Linking, Platform } from 'react-native';
 import { Feather, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../../../lib/supabase';
+import * as Sharing from 'expo-sharing';
+import * as FileSystem from 'expo-file-system';
 import PatientHistoryScreen from './PatientHistoryScreen';
 import PatientHeader from '../PatientHeader';
 import PatientSideMenu from '../PatientSideMenu';
@@ -147,6 +149,7 @@ export default function PatientRecordsScreen() {
   const [userData, setUserData] = useState({ name: 'Patient', email: '' });
   const [drawerVisible, setDrawerVisible] = useState(false);
   const toggleDrawer = () => setDrawerVisible(!drawerVisible);
+  const [authSessionMissing, setAuthSessionMissing] = useState(false);
 
   const fetchUserData = async () => {
     try {
@@ -172,29 +175,127 @@ export default function PatientRecordsScreen() {
 
   const getApiBaseUrl = () => {
     const raw = `${process.env.EXPO_PUBLIC_API_BASE_URL || ''}`.trim();
-    return raw ? raw.replace(/\/+$/, '') : '';
+    return raw ? raw.replace(/\/+$/, '') : 'https://api.pascualinga.com';
   };
 
-  const getApiBaseUrlForBilling = () => {
+  const getMobileProxyBase = () => {
     const fromEnv = getApiBaseUrl();
     return fromEnv || 'https://api.pascualinga.com';
+  };
+
+  const getApiBaseUrlForBilling = () => getMobileProxyBase();
+
+  const loadSessionTokenForPatient = async ({ email }) => {
+    let token = '';
+    let source = 'none';
+    let refreshAttempted = false;
+    try {
+      let { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      if (!sessionError && sessionData?.session?.access_token) {
+        token = sessionData.session.access_token.trim();
+        source = 'supabase.auth.getSession()';
+      }
+      if (!token) {
+        // Session might be stale or missing — try explicit refresh
+        refreshAttempted = true;
+        const refreshed = await supabase.auth.refreshSession().catch(() => ({ data: null, error: 'refresh-threw' }));
+        if (refreshed?.data?.session?.access_token) {
+          token = refreshed.data.session.access_token.trim();
+          source = 'supabase.auth.refreshSession()';
+        } else {
+          // Last attempt: no session at all, see if we can sign in silently by getting current user
+          const current = await supabase.auth.getUser().catch(() => ({ data: null, error: 'getuser-threw' }));
+          if (current?.data?.user && refreshed?.data?.session?.access_token) {
+            token = refreshed.data.session.access_token.trim();
+            source = 'supabase.auth.getUser()+refresh()';
+          }
+        }
+      }
+    } catch (sessErr) {
+      // eslint-disable-next-line no-console
+      console.log('[Forensics: lab:mine:token] supabase auth lookup threw (non-fatal):', {
+        message: sessErr?.message || String(sessErr || ''),
+      });
+    }
+    if (!token) {
+      try {
+        const cuRaw = await AsyncStorage.getItem('currentUser');
+        if (cuRaw) {
+          try {
+            const cu = JSON.parse(cuRaw);
+            if (cu && typeof cu === 'object') {
+              const candFields = ['access_token', 'accessToken', 'sessionToken', 'session_token', 'token', 'authToken', 'auth_token', 'jwt', 'bearer'];
+              for (const f of candFields) {
+                if (typeof cu[f] === 'string' && cu[f].trim()) { token = cu[f].trim(); source = `currentUser.${f}`; break; }
+                const d = cu.data;
+                if (d && typeof d === 'object' && typeof d[f] === 'string' && d[f].trim()) { token = d[f].trim(); source = `currentUser.data.${f}`; break; }
+                const u = cu.user;
+                if (u && typeof u === 'object' && typeof u[f] === 'string' && u[f].trim()) { token = u[f].trim(); source = `currentUser.user.${f}`; break; }
+              }
+              if (!token && typeof cu.session?.access_token === 'string') {
+                token = cu.session.access_token.trim();
+                source = 'currentUser.session.access_token';
+              }
+            }
+          } catch (_) {}
+        }
+      } catch (_) {}
+    }
+    if (!token) {
+      try { const v = await AsyncStorage.getItem('sessionToken'); if (v && typeof v === 'string' && v.trim()) { token = v.trim(); source = 'AsyncStorage.sessionToken'; } } catch (_) {}
+    }
+    // eslint-disable-next-line no-console
+    console.log('[Forensics: lab:mine:token]', {
+      emailSanitized: email ? `${email.substring(0, 3)}***@***` : '',
+      hasToken: Boolean(token),
+      tokenLength: String(token || '').length,
+      source,
+      refreshAttempted,
+      note: 'Per backend commit da276d29: token should come from supabase.auth.getSession(). If hasToken=false, user MUST LOGOUT then LOGIN AGAIN — LoginScreen now auto-creates missing Supabase Auth user via signUp() if signInWithPassword fails (accounts table credentials already verified).',
+    });
+    return {
+      hasToken: Boolean(token),
+      token,
+      hasBearer: Boolean(token),
+      bearer: token,
+      tokenLength: String(token || '').length,
+      startsWithBearer: `Bearer ${token || ''}`.startsWith('Bearer '),
+    };
   };
 
   const fetchLabResultsMine = async ({ email, name, patientId, take = 50 }) => {
     const base = getApiBaseUrl();
     if (!base) return [];
 
+    const { hasToken, token, tokenLength, startsWithBearer } = await loadSessionTokenForPatient({ email });
+    // EXACT pre-fetch log per backend spec — NEVER print actual token
+    // eslint-disable-next-line no-console
+    console.log({ hasToken, tokenLength, startsWithBearer });
+    // eslint-disable-next-line no-console
+    console.log('[Auth: lab-results:mine]', { endpoint: '/api/lab-results/mine', take });
+
     const url = `${base}/api/lab-results/mine?take=${encodeURIComponent(String(take))}`;
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: {
-        Accept: 'application/json',
-        'x-user-role': 'patient',
-        'x-user-email': email,
-        ...(name ? { 'x-user-name': name } : {}),
-        ...(patientId ? { 'x-patient-id': patientId } : {}),
-      },
+    const headers = { Accept: 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    // ================================================================
+    // FORENSIC DEBUG LOG (per web dev request 2026-09-15):
+    // Request URL used to populate Medical Records list — NO TOKENS
+    // ================================================================
+    // eslint-disable-next-line no-console
+    console.log('[Forensics: lab:mine:request]', {
+      requestUrl: url,
+      requestMethod: 'GET',
+      requestHeaderKeys: Object.keys(headers).sort(),
+      requestHeaderAccept: headers.Accept || '',
+      requestHasAuthorizationHeader: Boolean(token),
+      requestHasXUserHeaders: Object.keys(headers).some(k => String(k).toLowerCase().startsWith('x-user')),
+      patientIdSanitized: `${patientId || ''}`.slice(0, 6) + (patientId && patientId.length > 6 ? '...' : ''),
+      note: 'Per latest spec: STRICTLY Authorization: Bearer <supabase_access_token> only. No x-user fallbacks, no other auth schemes.',
     });
+
+    const res = await fetch(url, { method: 'GET', headers });
+    const httpStatus = res?.status || 0;
 
     const text = await res.text().catch(() => '');
     let data = null;
@@ -205,6 +306,75 @@ export default function PatientRecordsScreen() {
         data = null;
       }
     }
+
+    // ================================================================
+    // FORENSIC DEBUG LOG (per web dev request 2026-09-15):
+    // HTTP status + response structure + raw result ID 22 object
+    // BEFORE any app mapping/transformation.
+    // Print EVERY raw top-level key and full ID=22 response.
+    // ALL signed tokens redacted.
+    // ================================================================
+    const CENSOR_TOKEN_REGEX = /\/mobile\/[^/]+(\/[^/]+\.pdf)/g;
+    const CENSOR_BEARER_REGEX = /Bearer\s+[A-Za-z0-9\-_.]+/g;
+    const censor = (val) => {
+      if (val === null || val === undefined) return val;
+      if (typeof val === 'string') return val.replace(CENSOR_TOKEN_REGEX, '/mobile/{signed-token}$1').replace(CENSOR_BEARER_REGEX, 'Bearer {redacted}');
+      if (typeof val === 'number' || typeof val === 'boolean') return val;
+      if (Array.isArray(val)) return val.map(censor);
+      if (typeof val === 'object') {
+        const out = {};
+        for (const [k, v] of Object.entries(val)) {
+          const lk = String(k).toLowerCase();
+          if (lk === 'password' || lk === 'otp' || lk === 'challengeid' || lk === 'challenge_id') {
+            out[k] = '{redacted}';
+          } else if (lk === 'sessiontoken' || lk === 'session_token' || lk === 'token' || lk === 'accesstoken' || lk === 'access_token' || lk === 'jwt' || lk === 'bearer') {
+            out[k] = typeof v === 'string' ? `{len=${String(v || '').length}}` : (v === null || v === undefined ? v : '{redacted}');
+          } else {
+            out[k] = censor(v);
+          }
+        }
+        return out;
+      }
+      return val;
+    };
+
+    const allResultsRaw = Array.isArray(data) ? data : Array.isArray(data?.data) ? data.data : [];
+    const result22 = allResultsRaw.find(r => {
+      const candIds = new Set([
+        `${r?.id || ''}`.trim(),
+        `${r?.result_id || ''}`.trim(),
+        `${r?.resultId || ''}`.trim(),
+        `${r?.lab_result_id || ''}`.trim(),
+        `${r?.labResultId || ''}`.trim(),
+        `${r?.record_id || ''}`.trim(),
+        `${r?.recordId || ''}`.trim(),
+      ]);
+      return candIds.has('22') || candIds.has('22.0');
+    });
+
+    // eslint-disable-next-line no-console
+    console.log('[Forensics: lab:mine:response]', {
+      requestUrl: url,
+      httpStatus,
+      httpOk: res?.ok || false,
+      responseContentType: res?.headers?.get?.('content-type') || '',
+      responseTopLevelShape: {
+        isArray: Array.isArray(data),
+        topKeys: data && typeof data === 'object' && !Array.isArray(data) ? Object.keys(data) : null,
+        dataIsArray: Array.isArray(data?.data),
+        totalRawResults: allResultsRaw.length,
+      },
+      id22Found: Boolean(result22),
+      id22RawObjectBeforeAnyMapping: censor(result22 || null),
+      allRawIds: allResultsRaw.map(r => ({
+        id: `${r?.id || ''}`.trim() || null,
+        result_id: `${r?.result_id || ''}`.trim() || null,
+        resultId: `${r?.resultId || ''}`.trim() || null,
+        lab_result_id: `${r?.lab_result_id || ''}`.trim() || null,
+        title: typeof r?.title === 'string' ? r.title.slice(0, 40) : (typeof r?.name === 'string' ? r.name.slice(0, 40) : null),
+      })).slice(0, 20),
+    });
+
     if (!res.ok) {
       const msg = data?.message || data?.error || text || `HTTP ${res.status}`;
       throw new Error(`${msg}`.trim());
@@ -215,16 +385,19 @@ export default function PatientRecordsScreen() {
   const fetchBillingPaymentsMine = async ({ email, patientId, take = 50, skip = 0, baseOverride }) => {
     const base = `${baseOverride || ''}`.trim() || getApiBaseUrlForBilling();
     if (!base) return [];
+
+    const { hasToken, token, tokenLength, startsWithBearer } = await loadSessionTokenForPatient({ email });
+    // EXACT pre-fetch log per backend spec — NEVER print actual token
+    // eslint-disable-next-line no-console
+    console.log({ hasToken, tokenLength, startsWithBearer });
+    // eslint-disable-next-line no-console
+    console.log('[Auth: billing:mine:payments]', { endpoint: '/api/billing/mine/payments', take, skip });
+
     const url = `${base}/api/billing/mine/payments?take=${encodeURIComponent(String(take))}&skip=${encodeURIComponent(String(skip))}`;
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: {
-        Accept: 'application/json',
-        'x-user-role': 'patient',
-        ...(email ? { 'x-user-email': email } : {}),
-        ...(patientId ? { 'x-patient-id': patientId } : {}),
-      },
-    });
+    const headers = { Accept: 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const res = await fetch(url, { method: 'GET', headers });
 
     const text = await res.text().catch(() => '');
     let data = null;
@@ -388,13 +561,83 @@ export default function PatientRecordsScreen() {
       let fromLabResults = [];
       try {
         const apiBase = getApiBaseUrl();
-        let labResults = apiBase
-          ? await fetchLabResultsMine({ email, name: userName, patientId, take: 50 })
-          : await fetchLabResultsFromSupabase({ email, take: 50 });
-        if (apiBase && (!labResults || !labResults.length)) {
-          const fallback = await fetchLabResultsFromSupabase({ email, take: 50 }).catch(() => []);
-          if (fallback?.length) labResults = fallback;
+        let apiLabResults = [];
+        let apiCallSucceededWith200 = false;
+        // Check auth session BEFORE attempting API call — show warning banner if missing
+        try {
+          const sess = await loadSessionTokenForPatient({ email });
+          if (!sess?.hasToken) {
+            setAuthSessionMissing(true);
+          } else {
+            setAuthSessionMissing(false);
+          }
+        } catch (_) { /* ignore — just don't show banner */ }
+        if (apiBase) {
+          try {
+            apiLabResults = await fetchLabResultsMine({ email, name: userName, patientId, take: 50 });
+            // If we got here with NO exception thrown = API call completed successfully (200 OK)
+            // even if the result list is EMPTY (0 records). This means the backend has
+            // confirmed the user has ZERO lab records assigned. Do NOT fall back to Supabase
+            // local lab_results table in that case (avoids showing OTHER PATIENTS' global
+            // records that happen to live in the Supabase table without strict per-user RLS).
+            apiCallSucceededWith200 = true;
+          } catch (e) {
+            const m = `${e?.message || e}`.trim();
+            if (m) {
+              console.log('Records: API lab fetch error (fallback to Supabase):', m);
+              const lower = `${m || ''}`.toLowerCase();
+              if (lower.includes('authentication required') || lower.includes('sign in') || lower.includes('401') || lower.includes('unauthorized')) {
+                setAuthSessionMissing(true);
+              }
+            }
+            apiLabResults = [];
+          }
         }
+        let supaLabResults = [];
+        // ----------------------------------------------------------------
+        // CRITICAL PER-PATIENT PRIVACY FIX:
+        // Only use the Supabase local-lab_results fallback when the BACKEND
+        // API CALL ITSELF FAILED (network error, 500, unreachable).
+        // If the backend API returned HTTP 200 OK (even with 0 records =
+        // totalRawResults: 0), the backend is the source of truth. We MUST
+        // NOT merge in Supabase fallback rows in that scenario — otherwise
+        // brand new accounts (with no records) will see GLOBAL / OTHER
+        // PATIENTS' records from the pre-da276d29 Supabase table era.
+        // ----------------------------------------------------------------
+        if (!apiCallSucceededWith200) {
+          try {
+            supaLabResults = await fetchLabResultsFromSupabase({ email, take: 50 }).catch(() => []);
+          } catch (_) { supaLabResults = []; }
+        } else {
+          // Backend returned successfully — zero Supabase fallback.
+          supaLabResults = [];
+        }
+
+        const seenIds = new Set();
+        const merged = [];
+        const apiCount = (apiLabResults || []).length;
+        const supaCount = (supaLabResults || []).length;
+        for (const row of [...(apiLabResults || []), ...(supaLabResults || [])]) {
+          const id = `${row?.id || row?.lab_result_id || row?.result_id || JSON.stringify(row || '').slice(0, 50)}`;
+          if (seenIds.has(id)) continue;
+          seenIds.add(id);
+          merged.push({
+            ...(row || {}),
+            _source: apiLabResults?.includes(row) ? 'backend-api-da276d29' : 'supabase-fallback',
+          });
+        }
+        const labResults = merged;
+        const mergedCount = labResults.length;
+        // eslint-disable-next-line no-console
+        console.log('[Forensics: lab:mine:merge]', {
+          emailSanitized: email ? `${email.substring(0, 3)}***@***` : '',
+          apiCallSucceededWith200,
+          apiCount,
+          supaCount,
+          mergedCount,
+          supabaseFallbackUsed: !apiCallSucceededWith200 && supaCount > 0,
+          note: 'Privacy rule: Supabase fallback is ONLY used when backend API call throws (network/5xx). If backend returns 200 (even empty list = user truly has 0 records), supaCount is forced to 0 to avoid leaking other patients global legacy records stored in the Supabase lab_results table pre-da276d29.',
+        });
         fromLabResults = (labResults || []).map((r, idx) => {
           const pdfUrl =
             `${r?.url || r?.file_url || r?.fileUrl || r?.pdf_url || r?.pdfUrl || r?.public_url || r?.publicUrl || r?.link || r?.signed_url || r?.signedUrl || ''}`.trim();
@@ -653,22 +896,94 @@ export default function PatientRecordsScreen() {
     setModalVisible(true);
   }, []);
 
+  const FALLBACK_MOBILE_PROXY_BUCKETS_RECORDS = {
+    'lab-results': '/api/lab-results/file/mobile',
+    'lab_results': '/api/lab-results/file/mobile',
+    'labresults': '/api/lab-results/file/mobile',
+    'default': '/api/file/mobile',
+  };
+
   const resultUrlFrom = useCallback((raw) => {
     if (!raw) return '';
-    const url =
-      raw?.url ||
-      raw?.file_url ||
-      raw?.fileUrl ||
-      raw?.pdf_url ||
-      raw?.pdfUrl ||
-      raw?.public_url ||
-      raw?.publicUrl ||
-      raw?.link ||
-      raw?.attachment_url ||
-      raw?.attachmentUrl ||
-      '';
-    return `${url || ''}`.trim();
+
+    const FORBIDDEN_PREFIXES = ['lab-storage:', 'lab-local:', 'storage-local:', 'internal:', 'db:', 'storage:'];
+    const isForbidden = (s) => {
+      if (!s || typeof s !== 'string') return true;
+      const t = `${s}`.trim().toLowerCase();
+      for (const bad of FORBIDDEN_PREFIXES) if (t.startsWith(bad)) return true;
+      return false;
+    };
+    const isHttpLike = (s) => typeof s === 'string' && /^https?:\/\//i.test(`${s || ''}`.trim());
+
+    const flatKeys = [
+      'pdfUrl', 'fileUrl', 'file_url', 'pdf_url',
+      'public_url', 'publicUrl', 'download_url', 'downloadUrl',
+      'signed_url', 'signedUrl', 'attachment_url', 'attachmentUrl',
+      'storage_url', 'storageUrl', 'result_url', 'resultUrl',
+      'document_url', 'documentUrl',
+      'link', 'url',
+    ];
+
+    const pickFromObj = (obj) => {
+      if (!obj || typeof obj !== 'object') return '';
+      for (const k of flatKeys) {
+        const v = obj[k];
+        if (isHttpLike(v)) return `${v}`.trim();
+      }
+      return '';
+    };
+
+    const nested = ['file', 'files', 'pdf', 'document', 'attachment', 'result', 'record', 'storage', 'media', 'asset', 'metadata', 'meta', 'raw'];
+    let picked = pickFromObj(raw);
+    if (picked) return picked;
+
+    for (const n of nested) {
+      const nest = raw?.[n];
+      if (Array.isArray(nest)) {
+        for (const item of nest) {
+          const p = pickFromObj(item);
+          if (p) return p;
+        }
+      } else {
+        const p = pickFromObj(nest);
+        if (p) return p;
+        if (isHttpLike(nest)) return `${nest}`.trim();
+      }
+    }
+
+    if (Array.isArray(raw?.files) && raw.files[0]) {
+      const p = pickFromObj(raw.files[0]);
+      if (p) return p;
+    }
+    if (Array.isArray(raw?.attachments) && raw.attachments[0]) {
+      const p = pickFromObj(raw.attachments[0]);
+      if (p) return p;
+    }
+
+    const allKeys = raw && typeof raw === 'object' ? Object.keys(raw) : [];
+    for (const k of allKeys) {
+      const v = raw[k];
+      if (isHttpLike(v)) return `${v}`.trim();
+      if (typeof v === 'string' && isForbidden(v)) continue;
+      if (typeof v === 'object') {
+        const p = pickFromObj(v);
+        if (p) return p;
+      }
+    }
+    return '';
   }, []);
+
+  const normalizePdfInputToUrlRecords = useCallback(async (rawInput) => {
+    const s = `${rawInput || ''}`.trim();
+    if (!s) return '';
+    if (/^https?:\/\//i.test(s) || /^file:\/\//i.test(s) || /^content:\/\//i.test(s)) return s;
+    if (s.startsWith('//')) return `https:${s}`;
+    if (s.startsWith('/')) {
+      const base = getMobileProxyBase();
+      if (base) return `${base}${s}`;
+    }
+    return '';
+  }, [getMobileProxyBase]);
 
   const apiRawFromRecord = useCallback((record) => {
     const r = record?.raw;
@@ -680,6 +995,71 @@ export default function PatientRecordsScreen() {
     return looksNormalized ? r.raw : r;
   }, []);
 
+  const extractLabResultId = useCallback((normalized, apiRaw) => {
+    const isGoodNumericId = (v) => {
+      if (v === undefined || v === null) return false;
+      const s = `${v}`.trim();
+      if (!s) return false;
+      if (!/^[1-9][0-9]{0,7}$/.test(s)) return false;
+      const n = parseInt(s, 10);
+      if (!Number.isFinite(n) || n <= 0 || n >= 2000000000) return false;
+      return true;
+    };
+    const isPossibleIdKey = (k) => {
+      if (!k || typeof k !== 'string') return false;
+      const lk = k.toLowerCase();
+      if (lk.endsWith('id')) return true;
+      if (lk === 'pk') return true;
+      return false;
+    };
+    const knownIdKeys = new Set(['id', 'lab_result_id', 'labresultid', 'result_id', 'resultid', 'record_id', 'recordid', 'lab_id', 'labid', 'test_id', 'testid', 'report_id', 'reportid', 'document_id', 'documentid', 'file_id', 'fileid', 'pk', 'rowid', 'row_id']);
+    const deepCollect = (obj, out, depth) => {
+      if (depth === undefined) depth = 0;
+      if (depth > 8) return;
+      if (!obj) return;
+      if (Array.isArray(obj)) {
+        for (let i = 0; i < obj.length; i++) deepCollect(obj[i], out, depth + 1);
+        return;
+      }
+      if (typeof obj !== 'object') return;
+      const entries = Object.entries(obj);
+      for (const [k, v] of entries) {
+        const lk = `${k}`.toLowerCase();
+        if (isGoodNumericId(v)) {
+          out.push({ key: k, value: `${v}`, depth, known: knownIdKeys.has(lk) });
+        }
+        if (v && typeof v === 'object') deepCollect(v, out, depth + 1);
+      }
+    };
+    const candidates = [];
+    deepCollect(apiRaw, candidates, 0);
+    deepCollect(normalized, candidates, 0);
+    const preview = (() => {
+      try {
+        const s = JSON.stringify({ apiRawKeys: apiRaw ? Object.keys(apiRaw) : null, normKeys: normalized ? Object.keys(normalized) : null });
+        return s.length > 500 ? s.substring(0, 500) + '…' : s;
+      } catch (_) { return 'stringify-failed'; }
+    })();
+    const flatVals = candidates.map(c => c.value);
+    const uniq = [];
+    for (const x of candidates) {
+      const lk = `${x.key}`.toLowerCase();
+      const known = knownIdKeys.has(lk) || (isPossibleIdKey(x.key) && /[a-z]_id$|^id$|id$/i.test(x.key));
+      const score = (known ? 1000 : 0) + (x.depth === 0 ? 100 : 0) + (x.depth === 1 ? 50 : 0) - x.depth;
+      if (!uniq.some(u => u.value === x.value)) uniq.push({ value: x.value, key: x.key, depth: x.depth, known, score });
+    }
+    uniq.sort((a, b) => b.score - a.score);
+    const finalList = uniq.map(u => u.value);
+    console.log('[Auth:lab-result-id:extract]', {
+      title: normalized?.title || '',
+      previewStruct: preview,
+      numericIdsFound: flatVals.length,
+      candidatesSorted: uniq.map(u => ({ id: u.value, at: `${u.key}@depth${u.depth}`, knownKey: u.known })).slice(0, 12),
+      chosen: finalList[0] || '',
+    });
+    return finalList[0] || '';
+  }, []);
+
   const handleViewRecord = useCallback(() => {
     setModalVisible(false);
     const normalized = selectedDoc && selectedDoc?.source && selectedDoc?.raw ? selectedDoc : selectedDoc ? normalizeRecord(selectedDoc, 0) : null;
@@ -687,6 +1067,9 @@ export default function PatientRecordsScreen() {
 
     if (normalized.category === 'Laboratory') {
       const apiRaw = apiRawFromRecord(normalized) || normalized?.raw || null;
+      const actualId = extractLabResultId(normalized, apiRaw);
+      const signedUrl = resultUrlFrom(apiRaw);
+      const extraFromNormalized = normalized && typeof normalized === 'object' ? normalized : {};
       navigation.navigate('Laboratory', {
         doc: {
           name: normalized.title,
@@ -694,16 +1077,33 @@ export default function PatientRecordsScreen() {
           date: normalized.dateLabel,
           status: normalized.status,
           verificationStatus: normalized.verificationStatus,
-          url: resultUrlFrom(apiRaw),
-          labResultId: `${apiRaw?.id || apiRaw?.lab_result_id || apiRaw?.result_id || normalized?.id || ''}`.trim(),
+          labResultId: actualId,
+          url: signedUrl,
+          pdfUrl: extraFromNormalized.pdfUrl || apiRaw?.pdfUrl || apiRaw?.pdf_url || signedUrl,
+          fileUrl: apiRaw?.fileUrl || apiRaw?.file_url || '',
+          file_url: apiRaw?.file_url || '',
+          pdf_url: apiRaw?.pdf_url || '',
+          signed_url: apiRaw?.signed_url || apiRaw?.signedUrl || '',
+          public_url: apiRaw?.public_url || apiRaw?.publicUrl || '',
+          download_url: apiRaw?.download_url || apiRaw?.downloadUrl || '',
+          signedUrl: apiRaw?.signedUrl || '',
+          publicUrl: apiRaw?.publicUrl || '',
+          downloadUrl: apiRaw?.downloadUrl || '',
+          attachmentUrl: apiRaw?.attachmentUrl || apiRaw?.attachment_url || '',
+          documentUrl: apiRaw?.documentUrl || apiRaw?.document_url || '',
+          storageUrl: apiRaw?.storageUrl || apiRaw?.storage_url || '',
+          resultUrl: apiRaw?.resultUrl || apiRaw?.result_url || '',
+          link: apiRaw?.link || extraFromNormalized.link || '',
           raw: apiRaw,
+          normalizedRaw: normalized.raw,
+          pdfUrlSource: extraFromNormalized.pdfUrl ? 'fromLabResult' : signedUrl ? 'fromResultUrlFromApiRaw' : 'none',
         },
       });
       return;
     }
 
     Alert.alert('Record', `${normalized.title}\n\n${normalized.subtitle}`);
-  }, [apiRawFromRecord, navigation, resultUrlFrom, selectedDoc]);
+  }, [apiRawFromRecord, extractLabResultId, navigation, resultUrlFrom, selectedDoc]);
 
   const handleBookAppointment = useCallback(() => {
     setModalVisible(false);
@@ -718,23 +1118,166 @@ export default function PatientRecordsScreen() {
   const handleDownloadPdf = useCallback(async () => {
     const normalized = selectedDoc && selectedDoc?.source && selectedDoc?.raw ? selectedDoc : selectedDoc ? normalizeRecord(selectedDoc, 0) : null;
     if (!normalized) return;
-    const apiRaw = apiRawFromRecord(normalized) || normalized?.raw || null;
-    const url = resultUrlFrom(apiRaw);
-    if (!url) {
-      if (typeof __DEV__ !== 'undefined' && __DEV__) {
-        const keys = apiRaw && typeof apiRaw === 'object' ? Object.keys(apiRaw) : [];
-        Alert.alert('No PDF URL', `URL is empty.\n\nraw keys:\n${keys.join(', ') || '(none)'}`);
-        return;
-      }
-      Alert.alert('Unavailable', 'No PDF is attached to this record yet.');
+    if (normalized.category === 'Laboratory') {
+      const apiRawLR = apiRawFromRecord(normalized) || normalized?.raw || null;
+      const actualId = extractLabResultId(normalized, apiRawLR);
+      const signedUrlLR = resultUrlFrom(apiRawLR);
+      const extraFromNorm = normalized && typeof normalized === 'object' ? normalized : {};
+      navigation.navigate('Laboratory', {
+        doc: {
+          name: normalized.title, type: 'Laboratory Result', date: normalized.dateLabel,
+          status: normalized.status, verificationStatus: normalized.verificationStatus,
+          labResultId: actualId,
+          url: signedUrlLR,
+          pdfUrl: extraFromNorm.pdfUrl || apiRawLR?.pdfUrl || apiRawLR?.pdf_url || signedUrlLR,
+          fileUrl: apiRawLR?.fileUrl || apiRawLR?.file_url || '',
+          file_url: apiRawLR?.file_url || '',
+          pdf_url: apiRawLR?.pdf_url || '',
+          signed_url: apiRawLR?.signed_url || apiRawLR?.signedUrl || '',
+          public_url: apiRawLR?.public_url || apiRawLR?.publicUrl || '',
+          download_url: apiRawLR?.download_url || apiRawLR?.downloadUrl || '',
+          signedUrl: apiRawLR?.signedUrl || '',
+          publicUrl: apiRawLR?.publicUrl || '',
+          downloadUrl: apiRawLR?.downloadUrl || '',
+          attachmentUrl: apiRawLR?.attachmentUrl || apiRawLR?.attachment_url || '',
+          documentUrl: apiRawLR?.documentUrl || apiRawLR?.document_url || '',
+          storageUrl: apiRawLR?.storageUrl || apiRawLR?.storage_url || '',
+          resultUrl: apiRawLR?.resultUrl || apiRawLR?.result_url || '',
+          link: apiRawLR?.link || extraFromNorm.link || '',
+          raw: apiRawLR,
+          normalizedRaw: normalized.raw,
+          triggerDirectDownload: true,
+        },
+      });
       return;
     }
-    try {
-      await Linking.openURL(url);
-    } catch (_) {
-      Alert.alert('Error', 'Unable to open the PDF link.');
+    const apiRaw = apiRawFromRecord(normalized) || normalized?.raw || null;
+    const urlRaw = resultUrlFrom(apiRaw);
+    const FORBIDDEN_PREFIXES = ['lab-storage:', 'lab-local:', 'storage-local:', 'internal:', 'db:', 'storage:'];
+    const rawStorageRef = apiRaw && typeof apiRaw === 'object' ? (() => {
+      const vals = Object.values(apiRaw);
+      for (const v of vals) {
+        if (typeof v === 'string') {
+          const t = v.trim().toLowerCase();
+          for (const bad of FORBIDDEN_PREFIXES) if (t.startsWith(bad)) return v;
+        }
+        if (v && typeof v === 'object') {
+          for (const inner of Object.values(v)) {
+            if (typeof inner === 'string') {
+              const t = inner.trim().toLowerCase();
+              for (const bad of FORBIDDEN_PREFIXES) if (t.startsWith(bad)) return inner;
+            }
+          }
+        }
+      }
+      return '';
+    })() : '';
+    if (!urlRaw) {
+      const keys = apiRaw && typeof apiRaw === 'object' ? Object.keys(apiRaw) : [];
+      Alert.alert(
+        'PDF Not Available',
+        'Backend did not return a signed HTTPS PDF URL for this record.\n\n' +
+        'Expected: backend must include an HTTPS download URL (pdfUrl / fileUrl / downloadUrl / signedUrl / url) in the list API JSON response.\n\n' +
+        'The app will NOT construct URLs from internal storage references, and direct storage access is disabled.\n\n' +
+        (rawStorageRef ? `Raw internal ref (send to backend team):\n${rawStorageRef.slice(0, 180)}\n\n` : '') +
+        (keys.length ? `Raw JSON response keys: ${keys.join(', ')}` : '')
+      );
+      return;
     }
-  }, [apiRawFromRecord, resultUrlFrom, selectedDoc]);
+    const url = await normalizePdfInputToUrlRecords(urlRaw);
+    try {
+      if (!url) {
+        Alert.alert('Invalid Link', 'The PDF link could not be resolved. Raw value: ' + `${urlRaw || ''}`.substring(0, 150));
+        return;
+      }
+
+      if (Platform.OS === 'web') {
+        try { window.open(url, '_blank', 'noopener,noreferrer'); return; } catch (_) { /* fallthrough */ }
+      }
+
+      const cacheDir = `${FileSystem.cacheDirectory || ''}`;
+
+      const safeName = `${normalized?.title || 'record'}`.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 80) || 'medical_record';
+
+      const validatePdfFile = async (targetFileUri) => {
+        try {
+          const info = await FileSystem.getInfoAsync(targetFileUri).catch(() => null);
+          if (!info || !info.exists || typeof info.size !== 'number' || info.size <= 0) return false;
+          let head = '';
+          try {
+            head = await FileSystem.readAsStringAsync(targetFileUri, {
+              length: Math.min(512, info.size), position: 0, encoding: FileSystem.EncodingType.UTF8,
+            });
+          } catch (_) { head = ''; }
+          const headTrim = (head || '').replace(/^\uFEFF/, '').trimStart();
+          if (headTrim.substring(0, 5) === '%PDF-') return true;
+          if (headTrim.toUpperCase().includes('%PDF-')) return true;
+          if (/^\s*<\s*(!doctype|html|head|body)/i.test(headTrim)) return false;
+          if (/Cannot\s+(GET|POST|PUT|DELETE)|NotFound|Not Found|Error\s+404/i.test(headTrim)) return false;
+          if (/<\s*html[\s>]/i.test(headTrim) || /<\s*title[^>]*error/i.test(headTrim)) return false;
+          return info.size > 8000;
+        } catch (_) { return false; }
+      };
+
+      const tryDownloadFromUrl = async (targetUrl, targetFileUri) => {
+        const headers = { Accept: 'application/pdf,*/*' };
+        const r = await FileSystem.downloadAsync(targetUrl, targetFileUri, { headers });
+        if (!r || !r.uri) throw new Error(`Download failed (null response)`);
+        const statusCode = r.status || 0;
+        const size = typeof r.totalBytesWritten === 'number' ? r.totalBytesWritten : (typeof r.size === 'number' ? r.size : 0);
+        if (statusCode !== 200 && statusCode !== 206) throw new Error(`Download failed (PDF download failed with HTTP ${statusCode}).`);
+        if (size <= 0) throw new Error(`Download failed (empty file 0 bytes, HTTP ${statusCode})`);
+        if (r.headers && typeof r.headers === 'object') {
+          const ct = `${r.headers['content-type'] || r.headers['Content-Type'] || ''}`.toLowerCase();
+          if (ct && !ct.includes('application/pdf') && !ct.includes('pdf')) {
+            try { await FileSystem.deleteAsync(r.uri, { idempotent: true }).catch(() => {}); } catch (_) {}
+            throw new Error(`Server returned Content-Type "${ct}" instead of application/pdf (HTTP ${statusCode}).`);
+          }
+        }
+        const isPdf = await validatePdfFile(r.uri);
+        if (!isPdf) {
+          try { await FileSystem.deleteAsync(r.uri, { idempotent: true }).catch(() => {}); } catch (_) {}
+          throw new Error(`Download failed (not a valid PDF bytes, likely error page HTML, size=${size}B, HTTP ${statusCode})`);
+        }
+        return { uri: r.uri, status: statusCode, size };
+      };
+
+      let fileUri = `${cacheDir}${safeName}_${Date.now()}.pdf`;
+      let result = null;
+
+      try {
+        result = await tryDownloadFromUrl(url, fileUri);
+      } catch (e1) {
+        throw e1;
+      }
+
+      if (!result || !result?.uri) throw new Error('Download returned no file.');
+
+      const canShare = await Sharing.isAvailableAsync();
+      if (canShare) {
+        try {
+          await Sharing.shareAsync(result.uri, {
+            mimeType: 'application/pdf',
+            dialogTitle: `${normalized?.title || 'Medical Record'}`,
+            UTI: 'com.adobe.pdf',
+          });
+          return;
+        } catch (shareErr) {}
+      }
+
+      try {
+        await Linking.openURL(result.uri);
+      } catch (openErr) {
+        Alert.alert('PDF Downloaded', `Saved locally (${Math.round((result?.size || 0) / 1024)} KB). Open Files / Downloads app to view.`);
+      }
+    } catch (e) {
+      const msg = e && typeof e === 'object' ? `${e.message || ''}${e.code ? ' [' + e.code + ']' : ''}` : String(e || '');
+      Alert.alert(
+        'Error',
+        `Unable to open the PDF link.\n\n${msg ? 'Details: ' + msg.slice(0, 500) : ''}`
+      );
+    }
+  }, [apiRawFromRecord, normalizePdfInputToUrlRecords, resultUrlFrom, selectedDoc, navigation]);
 
   const visibleRecords = useMemo(() => {
     return records.filter((r) => `${r?.status || ''}`.trim().toLowerCase() !== 'rejected');
@@ -801,6 +1344,73 @@ export default function PatientRecordsScreen() {
       <View style={styles.header}>
         {renderSectionTabs}
       </View>
+
+      {authSessionMissing && activeSection === 'Medical' ? (
+        <View style={{
+          marginHorizontal: 16,
+          marginTop: 12,
+          marginBottom: 4,
+          padding: 14,
+          borderRadius: 14,
+          backgroundColor: '#FEF2F2',
+          borderWidth: 1.5,
+          borderColor: '#F87171',
+          flexDirection: 'row',
+          alignItems: 'flex-start',
+          gap: 10,
+          elevation: 2,
+          shadowColor: '#7F1D1D',
+          shadowOffset: { width: 0, height: 2 },
+          shadowOpacity: 0.1,
+          shadowRadius: 4,
+        }}>
+          <MaterialCommunityIcons name="alert-octagon" size={22} color="#B91C1C" style={{ marginTop: 1 }} />
+          <View style={{ flex: 1 }}>
+            <Text style={{ color: '#7F1D1D', fontWeight: '800', fontSize: 14, marginBottom: 4, letterSpacing: 0.2 }}>
+              ⚠️ NO SUPABASE SESSION — PDF download will fail!
+            </Text>
+            <Text style={{ color: '#7F1D1D', fontSize: 12.5, lineHeight: 18, marginBottom: 8 }}>
+              Walang Supabase access_token. Kaya ang /api/lab-results/mine ay nagre-return ng HTTP 401 "Authentication required", at ang mga lab result PDF URL ay lab-storage: (internal, NOT downloadable).
+            </Text>
+
+            <Text style={{ color: '#991B1B', fontSize: 12.5, lineHeight: 18, fontWeight: '800', marginBottom: 2 }}>
+              👤 FOR PATIENT USERS:
+            </Text>
+            <Text style={{ color: '#991B1B', fontSize: 12.5, lineHeight: 18, marginBottom: 10 }}>
+              Try: (1) Mag-LOG OUT muna (hamburger menu → Logout)  →  (2) Mag-LOGIN ULIT gamit ang same email + password.
+              {'\n'}Pagkatapos mag re-login, kung WALA PA RIN itong red banner = I-message mo ang clinic/admin para ma-fix ang Supabase Auth user mo gamit ang 2 options sa ibaba.
+            </Text>
+
+            <Text style={{ color: '#7F1D1D', fontSize: 12.5, lineHeight: 18, fontWeight: '800', marginBottom: 3 }}>
+              🛠️ FOR ADMIN / DEVELOPER — 2 WAYS TO FIX PERMANENTLY (applies to ALL ~10 existing accounts):
+            </Text>
+            <Text style={{ color: '#991B1B', fontSize: 12.5, lineHeight: 18, marginBottom: 2, fontWeight: '700' }}>
+              OPTION A — BULK SEED MANUAL SA DASHBOARD (RECOMMENDED, PINAKA-SECURE):
+            </Text>
+            <Text style={{ color: '#991B1B', fontSize: 12, lineHeight: 17.5, marginBottom: 8 }}>
+              Supabase → Authentication → Users → <Text style={{fontWeight:'700'}}>Add user</Text>
+              {'\n'}• <Text style={{fontWeight:'700'}}>Email:</Text> gamitin ang EXACT email mula sa `accounts` table (case sensitive!)
+              {'\n'}• <Text style={{fontWeight:'700'}}>Password:</Text> EXACT na password din na naka-store sa `accounts` table (para match ang login credentials)
+              {'\n'}• ✅ <Text style={{fontWeight:'700'}}>CHECK ang "Email confirmed"</Text> (huwag gagamit ng email confirmation link)
+              {'\n'}• Repeat para sa LAHAT ng ~10 existing patient/staff accounts.
+              {'\n'}• Signups REMAIN DISABLED after. Pinaka-safe for production — walang spam account.
+            </Text>
+
+            <Text style={{ color: '#991B1B', fontSize: 12.5, lineHeight: 18, marginBottom: 2, fontWeight: '700' }}>
+              OPTION B — TEMP ENABLE SIGNUPS (FASTER KUNG MARAMI ANG USERS):
+            </Text>
+            <Text style={{ color: '#991B1B', fontSize: 12, lineHeight: 17.5, marginBottom: 8 }}>
+              Supabase → Authentication → Configuration → <Text style={{fontWeight:'700'}}>Sign In / Providers</Text> → Email → Settings → <Text style={{fontWeight:'700'}}>TURN ON "Allow user signups"</Text> → Save.
+              {'\n'}Then sabihin sa LAHAT ng existing users: <Text style={{fontWeight:'700'}}>"Logout → Login ONE TIME lang"</Text> (awtomatikong gagawa ang LoginScreen ng Supabase Auth user nila via auto-signUp).
+              {'\n'}Pagkatapos ng 1-2 days (pag lahat nakapag-login na), <Text style={{fontWeight:'700'}}>DISABLE ULIT ANG SIGNUPS</Text> para iwas spam.
+            </Text>
+
+            <Text style={{ color: '#B91C1C', fontSize: 12, lineHeight: 17, marginTop: 4, fontStyle: 'italic' }}>
+              ⚡ Future-proofing note: The "Create Account" (OTPrequest.jsx) registration flow now calls supabase.auth.signUp() automatically. So NEW users registering after today will auto-get a Supabase Auth user — no manual seed needed anymore (as long as signups are enabled, or admin provisions them).
+            </Text>
+          </View>
+        </View>
+      ) : null}
 
       {activeSection === 'Medical' ? (
         <>

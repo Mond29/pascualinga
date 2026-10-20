@@ -1,8 +1,101 @@
-import React, { useCallback, useMemo, useState } from 'react';
-import { View, Text, StyleSheet, SafeAreaView, TouchableOpacity, ScrollView, Alert, ActivityIndicator, Linking } from 'react-native';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { View, Text, StyleSheet, SafeAreaView, TouchableOpacity, ScrollView, Alert, ActivityIndicator, Linking, Platform } from 'react-native';
 import { Feather, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useNavigation, useRoute } from '@react-navigation/native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Sharing from 'expo-sharing';
+import * as FileSystem from 'expo-file-system';
+
+const SCHEME_RE = /^([a-zA-Z][a-zA-Z0-9+\-.]*):/;
+const HTTPS_RE = /^https?:\/\//i;
+const URL_FLAT_KEYS = [
+  'pdfUrl', 'fileUrl', 'file_url', 'pdf_url',
+  'public_url', 'publicUrl', 'download_url', 'downloadUrl',
+  'signed_url', 'signedUrl', 'attachment_url', 'attachmentUrl',
+  'storage_url', 'storageUrl', 'result_url', 'resultUrl',
+  'document_url', 'documentUrl',
+  'link', 'url',
+];
+const FORBIDDEN_PREFIXES = ['lab-storage:', 'lab-local:', 'storage-local:', 'internal:', 'db:', 'storage:'];
+
+const safeJsonParse = (text) => {
+  try { return text ? JSON.parse(text) : null; } catch (_) { return null; }
+};
+
+const isHttpLike = (s) => typeof s === 'string' && HTTPS_RE.test(`${s || ''}`.trim());
+
+const isForbidden = (s) => {
+  if (!s || typeof s !== 'string') return true;
+  const t = `${s}`.trim().toLowerCase();
+  for (const bad of FORBIDDEN_PREFIXES) if (t.startsWith(bad)) return true;
+  return false;
+};
+
+const pickHttpsUrl = (obj) => {
+  if (!obj || typeof obj !== 'object') return '';
+  for (const k of URL_FLAT_KEYS) {
+    const v = obj[k];
+    if (isHttpLike(v)) return `${v}`.trim();
+  }
+  if (obj.url && typeof obj.url === 'object') {
+    for (const k of ['signedUrl', 'publicUrl', 'downloadUrl', 'fileUrl', 'pdfUrl', 'url', 'href']) {
+      if (isHttpLike(obj.url[k])) return `${obj.url[k]}`.trim();
+    }
+  }
+  return '';
+};
+
+const extractHttpsUrl = (root) => {
+  if (!root || typeof root !== 'object') return '';
+  const p = root && typeof root === 'object' ? root : {};
+  const pRaw = p?.raw && typeof p.raw === 'object' ? p.raw : {};
+  const pNormRaw = p?.normalizedRaw && typeof p.normalizedRaw === 'object' ? p.normalizedRaw : {};
+  const meta = p?.meta && typeof p.meta === 'object' ? p.meta : {};
+  const nestedKeys = ['file', 'files', 'pdf', 'document', 'attachment', 'result', 'record', 'storage', 'media', 'asset', 'metadata', 'meta', 'raw', 'normalizedRaw', 'data'];
+  const candidates = [p, pRaw, pNormRaw, meta];
+  for (const c of candidates) {
+    let r = pickHttpsUrl(c);
+    if (r) return r;
+    for (const n of nestedKeys) {
+      const nest = c?.[n];
+      if (Array.isArray(nest)) {
+        for (const item of nest) {
+          const r2 = pickHttpsUrl(item);
+          if (r2) return r2;
+        }
+      } else {
+        const r2 = pickHttpsUrl(nest);
+        if (r2) return r2;
+        if (isHttpLike(nest)) return `${nest}`.trim();
+      }
+    }
+    if (Array.isArray(c?.files) && c.files[0]) {
+      const r3 = pickHttpsUrl(c.files[0]);
+      if (r3) return r3;
+    }
+    if (Array.isArray(c?.attachments) && c.attachments[0]) {
+      const r4 = pickHttpsUrl(c.attachments[0]);
+      if (r4) return r4;
+    }
+    for (const [, v] of Object.entries(c)) {
+      if (isHttpLike(v)) return `${v}`.trim();
+      if (v && typeof v === 'object') {
+        const r5 = pickHttpsUrl(v);
+        if (r5) return r5;
+      }
+    }
+  }
+  return '';
+};
+
+const sanitizeFilename = (raw) => {
+  const s = `${raw || ''}`.trim().replace(/\s+/g, '_');
+  return s.replace(/[^A-Za-z0-9_\-]/g, '').slice(0, 60) || 'lab_result';
+};
+
+const safeUrlPreview = (url) => {
+  if (!url) return '';
+  return `${url || ''}`.replace(/(\/mobile\/)[^/]+(\/[^/]+\.pdf)/i, '$1{signed-token}$2');
+};
 
 export default function Laboratory() {
   const navigation = useNavigation();
@@ -12,144 +105,202 @@ export default function Laboratory() {
   const title = `${doc?.name || doc?.title || ''}`.trim() || 'Laboratory Result';
   const dateLabel = `${doc?.date || doc?.resultDate || ''}`.trim() || '—';
   const status = `${doc?.status || doc?.verificationStatus || ''}`.trim() || '—';
-  const urlFromDoc = `${doc?.url || doc?.pdfUrl || doc?.fileUrl || doc?.link || ''}`.trim();
-  const raw = doc?.raw || null;
-  const labResultId = `${doc?.labResultId || doc?.id || raw?.id || raw?.lab_result_id || raw?.result_id || ''}`.trim();
+  const labResultId = `${doc?.labResultId || ''}`.trim();
 
-  const resolvePdfUrl = useCallback((payload) => {
-    const p = payload && typeof payload === 'object' ? payload : {};
-    const pRaw = p?.raw && typeof p.raw === 'object' ? p.raw : {};
-    const meta = p?.meta && typeof p.meta === 'object' ? p.meta : {};
-    const picked =
-      p?.url ||
-      p?.pdfUrl ||
-      p?.fileUrl ||
-      p?.file_url ||
-      p?.pdf_url ||
-      p?.public_url ||
-      p?.publicUrl ||
-      p?.link ||
-      p?.signed_url ||
-      p?.signedUrl ||
-      pRaw?.url ||
-      pRaw?.pdfUrl ||
-      pRaw?.fileUrl ||
-      pRaw?.file_url ||
-      pRaw?.pdf_url ||
-      pRaw?.public_url ||
-      pRaw?.publicUrl ||
-      pRaw?.link ||
-      pRaw?.signed_url ||
-      pRaw?.signedUrl ||
-      pRaw?.attachment_url ||
-      pRaw?.attachmentUrl ||
-      pRaw?.storage_url ||
-      pRaw?.storageUrl ||
-      pRaw?.result_url ||
-      pRaw?.resultUrl ||
-      meta?.url ||
-      meta?.pdfUrl ||
-      meta?.fileUrl ||
-      '';
-    return `${picked || ''}`.trim();
-  }, []);
+  const initialUrl = useMemo(() => {
+    const httpsFromDoc = extractHttpsUrl(doc || {});
+    if (httpsFromDoc) return httpsFromDoc;
+    return '';
+  }, [doc]);
 
-  const initialUrl = useMemo(() => resolvePdfUrl({ ...doc, raw }), [doc, raw, resolvePdfUrl]);
   const [resolvedUrl, setResolvedUrl] = useState(initialUrl);
   const [resolving, setResolving] = useState(false);
-  const [resolvedOnce, setResolvedOnce] = useState(false);
 
-  const getApiBaseUrl = useCallback(() => {
-    const rawBase = `${process.env.EXPO_PUBLIC_API_BASE_URL || ''}`.trim();
-    return rawBase ? rawBase.replace(/\/+$/, '') : '';
-  }, []);
-
-  const safeJsonParse = useCallback((text) => {
-    try {
-      return text ? JSON.parse(text) : null;
-    } catch {
-      return null;
-    }
-  }, []);
-
-  const fetchLatestLabResult = useCallback(async () => {
-    const base = getApiBaseUrl();
-    if (!base || !labResultId) return null;
-
-    const email = `${(await AsyncStorage.getItem('userEmail')) || ''}`.trim().toLowerCase();
-    const patientId = `${(await AsyncStorage.getItem(`patientId:${email}`)) || ''}`.trim();
-    const name = `${(await AsyncStorage.getItem(`userName:${email}`)) || ''}`.trim();
-
-    const url = `${base}/api/lab-results/mine?take=200`;
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: {
-        Accept: 'application/json',
-        'x-user-role': 'patient',
-        ...(email ? { 'x-user-email': email } : {}),
-        ...(name ? { 'x-user-name': name } : {}),
-        ...(patientId ? { 'x-patient-id': patientId } : {}),
+  useEffect(() => {
+    // eslint-disable-next-line no-console
+    console.log('[Lab:init] Laboratory screen opened with doc keys:', {
+      labResultId,
+      urlPreview: safeUrlPreview(initialUrl),
+      hasRaw: Boolean(doc?.raw),
+      hasNormalizedRaw: Boolean(doc?.normalizedRaw),
+      docFields: doc && typeof doc === 'object' ? Object.keys(doc).filter(k => k !== 'raw' && k !== 'normalizedRaw').join(', ') : '',
+      urlFieldValues: {
+        url: safeUrlPreview(doc?.url),
+        pdfUrl: safeUrlPreview(doc?.pdfUrl),
+        fileUrl: safeUrlPreview(doc?.fileUrl),
+        signedUrl: safeUrlPreview(doc?.signedUrl || doc?.signed_url),
+        publicUrl: safeUrlPreview(doc?.publicUrl || doc?.public_url),
       },
+      pdfUrlSource: doc?.pdfUrlSource || '',
     });
-
-    const text = await res.text().catch(() => '');
-    const parsed = safeJsonParse(text);
-    if (!res.ok) {
-      const msg = parsed?.message || parsed?.error || text || `HTTP ${res.status}`;
-      throw new Error(`${msg}`.trim());
+    if (doc?.triggerDirectDownload) {
+      // If opened from Download as PDF button: start immediately
+      const t = setTimeout(() => openPdf().catch(() => {}), 150);
+      return () => clearTimeout(t);
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-    const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.data) ? parsed.data : [];
-    const match = list.find((r) => {
-      if (!r) return false;
-      const id1 = `${r?.id || ''}`.trim();
-      const id2 = `${r?.lab_result_id || ''}`.trim();
-      const id3 = `${r?.result_id || ''}`.trim();
-      return id1 === labResultId || id2 === labResultId || id3 === labResultId;
-    });
-    return match || null;
-  }, [getApiBaseUrl, labResultId, safeJsonParse]);
-
-  const ensurePdfUrl = useCallback(async () => {
-    const current = `${resolvedUrl || ''}`.trim();
-    if (current) return current;
-    if (!labResultId) return '';
-    if (resolving) return '';
-
+  const openPdf = useCallback(async () => {
+    setResolving(true);
     try {
-      setResolving(true);
-      const fresh = await fetchLatestLabResult();
-      const next = resolvePdfUrl({ raw: fresh || {} });
-      setResolvedUrl(next);
-      setResolvedOnce(true);
-      return next;
+      // ===== RULE 1 (per latest backend spec): NO FRESH GET /api/lab-results/{id} call =====
+      // The signed HTTPS PDF URL is already returned in the /mine Records list API response.
+      // We ONLY use the URL from doc params (fields: url, pdfUrl, fileUrl, signed_url, raw etc.)
+      // NO Authorization header is needed for the signed PDF URL itself.
+      const targetUrl = extractHttpsUrl(doc || {});
+
+      // eslint-disable-next-line no-console
+      console.log('[Lab:download] Extracting signed PDF URL from Records list passed doc:', {
+        labResultId,
+        foundHttpUrl: isHttpLike(targetUrl),
+        urlPreview: safeUrlPreview(targetUrl),
+      });
+
+      if (!targetUrl || !isHttpLike(targetUrl)) {
+        // Show exact debug info to user so they can send to backend team
+        const allFlatKeys = doc && typeof doc === 'object' ? Object.keys(doc).filter(k => k !== 'raw' && k !== 'normalizedRaw') : [];
+        const rawKeys = doc?.raw && typeof doc.raw === 'object' ? Object.keys(doc.raw).slice(0, 30) : [];
+        const badPrefixes = [];
+        for (const k of URL_FLAT_KEYS) {
+          const v = doc?.[k];
+          if (typeof v === 'string' && isForbidden(v)) badPrefixes.push(`${k}=${v.slice(0, 60)}`);
+        }
+        if (doc?.raw && typeof doc.raw === 'object') {
+          for (const k of URL_FLAT_KEYS) {
+            const v = doc.raw[k];
+            if (typeof v === 'string' && isForbidden(v)) badPrefixes.push(`raw.${k}=${v.slice(0, 60)}`);
+          }
+        }
+        const lines = [];
+        lines.push(`Lab Result ID: ${labResultId || 'n/a'}`);
+        lines.push('');
+        lines.push('Backend Records list did not include a signed HTTPS PDF URL for this result.');
+        lines.push('Expected: backend /api/lab-results/mine must return fields: url, pdfUrl, fileUrl, signed_url, or pdf_url as HTTPS like https://api.pascualinga.com/api/lab-results/file/mobile/{signed-token}/22.pdf');
+        lines.push('');
+        lines.push(`Scanned document fields: ${allFlatKeys.join(', ') || '(none)'}`);
+        if (rawKeys.length) lines.push(`Raw API JSON keys: ${rawKeys.join(', ')}`);
+        if (badPrefixes.length) lines.push(`\n⚠ Non-HTTPS internal refs found (NOT usable — backend must convert these first):\n${badPrefixes.join('\n')}`);
+        Alert.alert('PDF Not Available', lines.join('\n'));
+        return;
+      }
+
+      // ===== RULE 2 (per latest backend spec): Download exact URL via FileSystem → Share local =====
+      // eslint-disable-next-line no-console
+      console.log('[Lab:download] Starting FileSystem download for signed PDF URL:', {
+        urlPreview: safeUrlPreview(targetUrl),
+        cacheDir: FileSystem?.cacheDirectory || '(no cacheDir)',
+      });
+
+      setResolvedUrl(targetUrl);
+      const titleForFile = sanitizeFilename(title);
+      const ts = Math.floor(Date.now() / 1000);
+      const filename = `${titleForFile || 'lab_result'}_ID${labResultId || ''}_${ts}.pdf`;
+      const cacheDir = `${FileSystem?.cacheDirectory || ''}`.trim().replace(/\/+$/, '') + '/';
+      const localDest = `${cacheDir}${filename}`;
+
+      let downloadResult = null;
+      let downloadError = null;
+      try {
+        // Signed URL contains embedded token in path — NO extra Authorization headers.
+        downloadResult = await FileSystem.downloadAsync(targetUrl, localDest, {
+          headers: { Accept: 'application/pdf,*/*' },
+        });
+      } catch (e) {
+        downloadError = e;
+        // eslint-disable-next-line no-console
+        console.log('[Lab:download] FileSystem download threw (falling back to browser):', {
+          message: e?.message || String(e || ''),
+        });
+      }
+
+      if (downloadResult && downloadResult.status === 200 && downloadResult.uri) {
+        const ct = (downloadResult.headers && (downloadResult.headers['Content-Type'] || downloadResult.headers['content-type'])) || '';
+        const fileSize = typeof downloadResult.totalBytesWritten === 'number' ? downloadResult.totalBytesWritten : (typeof downloadResult.size === 'number' ? downloadResult.size : 0);
+        let fileInfoSize = 0;
+        try {
+          const fi = await FileSystem.getInfoAsync(downloadResult.uri).catch(() => null);
+          if (fi && typeof fi.size === 'number') fileInfoSize = fi.size;
+        } catch (_) {}
+        const finalSize = fileInfoSize || fileSize;
+        // eslint-disable-next-line no-console
+        console.log('[Forensics: lab:download:success]', {
+          labResultId,
+          httpStatus: downloadResult.status,
+          contentType: ct,
+          isApplicationPdf: ct ? ct.toLowerCase().includes('application/pdf') : 'content-type-missing',
+          sizeBytes: finalSize,
+          urlPreview: safeUrlPreview(targetUrl),
+          note: 'Per backend test criteria: PDF download should return HTTP 200 with Content-Type: application/pdf. Downloaded directly using the signed HTTPS url/pdfUrl from /api/lab-results/mine list response (no reconstruction).',
+        });
+        if (fileSize > 0 && await Sharing.isAvailableAsync().catch(() => false)) {
+          try {
+            await Sharing.shareAsync(downloadResult.uri, {
+              mimeType: 'application/pdf',
+              UTI: 'com.adobe.pdf',
+              dialogTitle: 'Open or save laboratory result (PDF)',
+            });
+            return;
+          } catch (shareErr) {
+            // eslint-disable-next-line no-console
+            console.log('[Lab:download] Sharing.shareAsync failed (falling back to Linking):', { message: shareErr?.message || '' });
+          }
+        }
+        // Sharing not available or failed, try Linking with local file:// as last resort
+        try {
+          await Linking.openURL(downloadResult.uri);
+          return;
+        } catch (_) {}
+      }
+
+      if (downloadResult && downloadResult.status && downloadResult.status !== 200) {
+        const ct = (downloadResult.headers && (downloadResult.headers['Content-Type'] || downloadResult.headers['content-type'])) || '';
+        const lines = [];
+        lines.push(`Lab Result ID: ${labResultId || 'n/a'}`);
+        lines.push(`\nPDF endpoint HTTP status: ${downloadResult.status}`);
+        if (ct) lines.push(`Content-Type: ${ct}`);
+        lines.push('\nThe signed PDF URL was invalid or has expired.');
+        lines.push('Per latest flow: Go back to the Records list and pull/swipe to refresh.');
+        lines.push('This will re-fetch /api/lab-results/mine with a valid Supabase session and return fresh signed URLs.');
+        lines.push(`\nSigned URL preview: ${safeUrlPreview(targetUrl)}`);
+        // eslint-disable-next-line no-console
+        console.log('[Forensics: lab:download:expired]', {
+          labResultId,
+          httpStatus: downloadResult.status,
+          contentType: ct,
+          urlPreview: safeUrlPreview(targetUrl),
+          note: 'Signed URL expired. User must return to Records list to trigger a fresh GET /api/lab-results/mine with valid Supabase session.',
+        });
+        Alert.alert('Signed URL Expired', lines.join('\n'));
+        return;
+      }
+
+      // Fallback: if FileSystem download throws (network, Kotlin type error, SDK issue)
+      // → revert to browser redirect per user's earlier working preference
+      // eslint-disable-next-line no-console
+      console.log('[Lab:download] Falling back to browser Linking.openURL() for signed PDF URL');
+      try {
+        if (Platform.OS === 'web' && typeof window !== 'undefined') {
+          try { window.open(targetUrl, '_blank', 'noopener,noreferrer'); return; } catch (_) {}
+        }
+        await Linking.openURL(targetUrl);
+        return;
+      } catch (linkErr) {
+        Alert.alert(
+          'Unable to Open PDF',
+          `Could not download or open the PDF.\n\n` +
+          `Lab Result ID: ${labResultId || 'n/a'}\n` +
+          (downloadError ? `Download error: ${String(downloadError.message || downloadError || '').slice(0, 150)}\n\n` : '') +
+          `Signed URL preview: ${safeUrlPreview(targetUrl)}`
+        );
+      }
     } finally {
       setResolving(false);
     }
-  }, [fetchLatestLabResult, labResultId, resolvePdfUrl, resolvedOnce, resolvedUrl, resolving]);
-
-  const openPdf = async () => {
-    const url = await ensurePdfUrl();
-    if (!url) {
-      if (typeof __DEV__ !== 'undefined' && __DEV__) {
-        const keys = raw && typeof raw === 'object' ? Object.keys(raw) : [];
-        Alert.alert('No PDF URL', `URL is empty.\n\nraw keys:\n${keys.join(', ') || '(none)'}`);
-        return;
-      }
-      Alert.alert('Unavailable', 'No PDF is attached to this result yet.');
-      return;
-    }
-
-    try {
-      await Linking.openURL(url);
-    } catch (_) {
-      Alert.alert('Error', 'Unable to open the PDF link.');
-    }
-  };
+  }, [labResultId, doc, title]);
 
   return (
     <SafeAreaView style={styles.container}>
-      {/* HEADER */}
       <View style={styles.header}>
         <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backButton}>
           <Feather name="arrow-left" size={24} color="#333" />
@@ -161,14 +312,12 @@ export default function Laboratory() {
       </View>
 
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
-        {/* DOCUMENT INFO */}
         <View style={styles.infoCard}>
           <View style={styles.docIconLarge}>
             <MaterialCommunityIcons name="test-tube" size={40} color="#DA7705" />
           </View>
           <Text style={styles.docName}>{title}</Text>
           <Text style={styles.docSub}>Laboratory • {dateLabel}</Text>
-
           <View style={[styles.statusPill, status === 'Available' ? styles.statusPillOk : status === 'Under review' ? styles.statusPillReview : styles.statusPillNeutral]}>
             <Text style={[styles.statusPillText, status === 'Available' ? styles.statusPillTextOk : status === 'Under review' ? styles.statusPillTextReview : styles.statusPillTextNeutral]}>
               {status}
@@ -182,10 +331,8 @@ export default function Laboratory() {
           ) : (
             <Feather name="file-text" size={20} color="#fff" />
           )}
-          <Text style={styles.primaryBtnText}>{resolving ? 'Finding PDF…' : 'Download as PDF'}</Text>
+          <Text style={styles.primaryBtnText}>{resolving ? 'Loading PDF…' : 'Download as PDF'}</Text>
         </TouchableOpacity>
-
-        {/* ACTIONS */}
       </ScrollView>
     </SafeAreaView>
   );
@@ -221,23 +368,14 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
   },
   docIconLarge: {
-    width: 80,
-    height: 80,
-    borderRadius: 40,
+    width: 80, height: 80, borderRadius: 40,
     backgroundColor: '#FFFAF0',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 15,
+    justifyContent: 'center', alignItems: 'center', marginBottom: 15,
   },
   docName: { fontSize: 20, fontWeight: 'bold', color: '#333', textAlign: 'center' },
   docSub: { fontSize: 14, color: '#888', marginTop: 5 },
 
-  statusPill: {
-    marginTop: 14,
-    paddingHorizontal: 12,
-    paddingVertical: 7,
-    borderRadius: 999,
-  },
+  statusPill: { marginTop: 14, paddingHorizontal: 12, paddingVertical: 7, borderRadius: 999 },
   statusPillNeutral: { backgroundColor: '#f1f5f9' },
   statusPillOk: { backgroundColor: '#F0FDF4' },
   statusPillReview: { backgroundColor: '#FFFAF0' },
@@ -261,5 +399,4 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   primaryBtnText: { color: '#fff', fontSize: 15, fontWeight: 'bold', marginLeft: 10 },
-
 });
